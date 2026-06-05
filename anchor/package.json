@@ -1,0 +1,11 @@
+{
+  "name": "@mmm/anchor",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "node-cron": "^3.0.3"
+  }
+}

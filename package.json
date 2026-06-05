@@ -1,0 +1,24 @@
+{
+  "name": "wss-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MMM WSS 网关 + Raft 共识节点 + 链监听（服务端部署仓库）",
+  "workspaces": [
+    "shared",
+    "private-chain",
+    "gateway",
+    "anchor",
+    "listener"
+  ],
+  "scripts": {
+    "node1": "npm run start -w private-chain -- --port 3001 --id node1",
+    "node2": "npm run start -w private-chain -- --port 3002 --id node2",
+    "node3": "npm run start -w private-chain -- --port 3003 --id node3",
+    "gateway": "npm run start -w gateway",
+    "listener": "npm run start -w listener",
+    "anchor": "npm run start -w anchor"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

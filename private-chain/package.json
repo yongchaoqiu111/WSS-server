@@ -1,0 +1,17 @@
+{
+  "name": "@mmm/private-chain",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/node.js",
+  "scripts": {
+    "start": "node src/node.js"
+  },
+  "dependencies": {
+    "@mmm/shared": "0.1.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "level": "^8.0.1",
+    "ws": "^8.18.0",
+    "yargs": "^17.7.2"
+  }
+}
