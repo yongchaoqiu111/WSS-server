@@ -13,11 +13,15 @@ const BONUS_CONFIG = {
 };
 
 const TIMEOUT_CONFIG = {
+  /** 购票/出场支付等待链上到账的总时限 */
   PAYMENT_TIMEOUT_HOURS: 24,
+  /** listener 与 App 轮询间隔（毫秒） */
+  POLL_INTERVAL_MS: 15000,
 };
 
 const ORDER_STATUS = {
   PENDING: 'pending',
+  QUEUED: 'queued',
   WAITING_PAYMENT: 'waiting_payment',
   CONFIRMED: 'confirmed',
   EXITING: 'exiting',

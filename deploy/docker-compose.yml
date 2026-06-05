@@ -49,6 +49,7 @@ services:
     command: ["node", "gateway/src/index.js"]
     environment:
       GATEWAY_PORT: 8443
+      GATEWAY_DOMAINS: ${GATEWAY_DOMAINS:-book26.top,news16.top}
       UPSTREAM_NODES: http://node1:3001,http://node2:3002,http://node3:3003
     ports:
       - "127.0.0.1:8443:8443"

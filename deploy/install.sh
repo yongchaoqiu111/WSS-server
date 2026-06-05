@@ -24,9 +24,12 @@ fi
 source .env
 
 if [[ -z "${MMM_DOMAIN:-}" || "$MMM_DOMAIN" == "api.example.com" ]]; then
-  echo "请在 deploy/.env 中设置 MMM_DOMAIN=你的域名"
+  echo "请在 deploy/.env 中设置 MMM_DOMAIN=你的主域名"
   exit 1
 fi
+
+MMM_DOMAINS="${MMM_DOMAINS:-$MMM_DOMAIN}"
+PRIMARY_DOMAIN="$MMM_DOMAIN"
 
 echo ">>> 安装 Docker..."
 if ! command -v docker &>/dev/null; then
@@ -51,15 +54,18 @@ fi
 echo ">>> 安装 Nginx..."
 apt-get install -y nginx certbot python3-certbot-nginx
 
-sed "s/__DOMAIN__/$MMM_DOMAIN/g" nginx/mmm.conf.template > "/etc/nginx/sites-available/mmm"
+sed -e "s/__SERVER_NAMES__/$MMM_DOMAINS/g" -e "s/__PRIMARY_DOMAIN__/$PRIMARY_DOMAIN/g" \
+  nginx/mmm.conf.template > "/etc/nginx/sites-available/mmm"
 ln -sf /etc/nginx/sites-available/mmm /etc/nginx/sites-enabled/mmm
 rm -f /etc/nginx/sites-enabled/default
 nginx -t
 
 echo ">>> 申请 SSL 证书（需域名已解析到本机）..."
-certbot --nginx -d "$MMM_DOMAIN" --non-interactive --agree-tos -m "${CERTBOT_EMAIL:-admin@$MMM_DOMAIN}" || {
+CERTBOT_ARGS=()
+for d in $MMM_DOMAINS; do CERTBOT_ARGS+=(-d "$d"); done
+certbot --nginx "${CERTBOT_ARGS[@]}" --non-interactive --agree-tos -m "${CERTBOT_EMAIL:-admin@$MMM_DOMAIN}" || {
   echo "Certbot 失败：请确认 DNS 已指向本机，然后手动执行:"
-  echo "  certbot --nginx -d $MMM_DOMAIN"
+  echo "  certbot --nginx ${CERTBOT_ARGS[*]}"
 }
 
 systemctl reload nginx
@@ -67,11 +73,11 @@ systemctl reload nginx
 echo ""
 echo "=========================================="
 echo "部署完成"
-echo "  HTTPS API:  https://$MMM_DOMAIN/api/status"
-echo "  WSS:        wss://$MMM_DOMAIN/ws"
-echo "  健康检查:   https://$MMM_DOMAIN/health"
+for d in $MMM_DOMAINS; do
+  echo "  https://$d/health"
+  echo "  wss://$d/ws"
+done
 echo ""
-echo "Flutter App 节点配置:"
-echo "  API:  https://$MMM_DOMAIN"
-echo "  WSS:  wss://$MMM_DOMAIN/ws"
+echo "Flutter App 默认双域名: $MMM_DOMAINS"
+echo "  域名列表 API: https://$MMM_DOMAIN/api/domains"
 echo "=========================================="

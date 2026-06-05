@@ -5,7 +5,14 @@ const cors = require('cors');
 const WebSocket = require('ws');
 const yargs = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
-const { QUEUE_TIERS, getAllTiers, DEFAULT_ANNOUNCEMENTS } = require('@mmm/shared');
+const {
+  QUEUE_TIERS,
+  getAllTiers,
+  DEFAULT_ANNOUNCEMENTS,
+  PAYMENT_CONFIG,
+  TIMEOUT_CONFIG,
+} = require('@mmm/shared');
+const { checkSend } = require('../../shared/chat-moderation');
 const { RaftNode, State } = require('./raft');
 const { ReservoirStateMachine } = require('./stateMachine');
 const { verifyCommandSignature } = require('./verify');
@@ -88,6 +95,47 @@ app.get('/api/ticket/quote', (_req, res) => {
   res.json(stateMachine.ticketQuote());
 });
 
+/** 诊断：收款地址是否从环境变量生效（部署后可用 curl 自测） */
+app.get('/api/system/payment-config', (_req, res) => {
+  const treasury = PAYMENT_CONFIG.TREASURY_ADDRESS || '';
+  const configured = treasury.startsWith('T') && !treasury.includes('PLACEHOLDER');
+  res.json({
+    serverBuild: 'ticket-pending-v2',
+    treasuryConfigured: configured,
+    treasury: configured ? treasury : null,
+    treasuryEnvSet: Boolean(process.env.TREASURY_ADDRESS),
+    pollIntervalMs: TIMEOUT_CONFIG.POLL_INTERVAL_MS,
+    paymentTimeoutHours: TIMEOUT_CONFIG.PAYMENT_TIMEOUT_HOURS,
+    nodeId: NODE_ID,
+  });
+});
+
+app.get('/api/ticket/purchase/:id', async (req, res) => {
+  const purchase = await stateMachine.getTicketPurchase(req.params.id);
+  res.json(purchase || { error: 'Purchase not found' });
+});
+
+app.get('/api/user/:address/ticket-purchase/pending', async (req, res) => {
+  const purchase = await stateMachine.getLatestPendingTicketPurchase(req.params.address);
+  res.json(purchase || { error: 'none' });
+});
+
+app.post('/api/ticket/purchase/:id/report-tx', async (req, res) => {
+  if (raft.state !== State.LEADER) {
+    return res.status(503).json({ success: false, error: 'Not leader' });
+  }
+  const { txHash, userAddress } = req.body || {};
+  if (!txHash || !userAddress) {
+    return res.status(400).json({ success: false, error: '缺少 txHash 或 userAddress' });
+  }
+  try {
+    const result = await stateMachine.reportTicketSelfTx(req.params.id, userAddress, txHash);
+    res.json({ success: true, purchase: result.purchase, user: result.user });
+  } catch (e) {
+    res.status(400).json({ success: false, error: e.message });
+  }
+});
+
 app.get('/api/assessment/:address', async (req, res) => {
   const user = await stateMachine.getUser(req.params.address);
   res.json(stateMachine.calcAssessment(user));
@@ -149,7 +197,13 @@ app.post('/api/command', async (req, res) => {
 
   raft.commitIndex = raft.log.length - 1;
   await raft.applyLogs();
-  res.json({ success: true, index: result.index });
+
+  const payload = { success: true, index: result.index };
+  if (command.type === 'BUY_TICKET' && userAddress) {
+    const purchase = await stateMachine.getLatestPendingTicketPurchase(userAddress);
+    if (purchase) payload.purchase = purchase;
+  }
+  res.json(payload);
 });
 
 app.get('/api/debug', async (_req, res) => {
@@ -204,6 +258,34 @@ wss.on('connection', (ws, req) => {
         const reservoir = await stateMachine.getReservoir();
         ws.send(JSON.stringify({ type: 'notification', topic: 'reservoir_updates', data: reservoir }));
       }
+
+      if (message.type === 'subscribe' && String(message.topic || '').startsWith('chat_')) {
+        ws.chatRooms = ws.chatRooms || new Set();
+        ws.chatRooms.add(String(message.topic).replace(/^chat_/, '') || 'hall');
+      }
+
+      if (message.type === 'chat_send') {
+        const room = message.room || 'hall';
+        const sender = message.sender || message.userAddress || '匿名';
+        const content = String(message.content || '').trim();
+        const check = checkSend({ sender, content });
+        if (!check.ok) {
+          ws.send(JSON.stringify({ type: 'chat_rejected', reason: check.reason }));
+          return;
+        }
+        const payload = {
+          type: 'notification',
+          topic: 'chat_hall',
+          data: {
+            id: `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            room,
+            sender,
+            content,
+            at: Date.now(),
+          },
+        };
+        broadcastChat(room, payload);
+      }
     } catch (err) {
       ws.send(JSON.stringify({ type: 'error', error: err.message }));
     }
@@ -216,6 +298,15 @@ function broadcast(message) {
   const text = JSON.stringify(message);
   clients.forEach((ws) => {
     if (ws.readyState === WebSocket.OPEN) ws.send(text);
+  });
+}
+
+function broadcastChat(room, payload) {
+  const text = JSON.stringify(payload);
+  clients.forEach((ws) => {
+    if (ws.readyState === WebSocket.OPEN && ws.chatRooms && ws.chatRooms.has(room)) {
+      ws.send(text);
+    }
   });
 }
 

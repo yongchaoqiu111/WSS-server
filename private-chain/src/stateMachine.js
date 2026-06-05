@@ -8,6 +8,7 @@ const {
   TICKET_PRICE_CONFIG,
   BONUS_CONFIG,
   PAYMENT_CONFIG,
+  TIMEOUT_CONFIG,
 } = require('@mmm/shared');
 
 class ReservoirStateMachine {
@@ -92,20 +93,131 @@ class ReservoirStateMachine {
     return user;
   }
 
-  async buyTicket(command) {
-    const user = await this.requireUser(command.userAddress);
-    user.ticketBalance += command.amount;
-    user.totalPurchased = (user.totalPurchased || 0) + command.amount;
-    await this.db.put(`user:${command.userAddress}`, user);
+  _randomUnitPrice() {
+    const { MIN_PRICE, MAX_PRICE } = TICKET_PRICE_CONFIG;
+    return Math.round((MIN_PRICE + Math.random() * (MAX_PRICE - MIN_PRICE)) * 100) / 100;
+  }
 
-    await this.db.put(`event:${Date.now()}:buy`, {
-      type: 'ticket_purchased',
+  _ticketPaymentTimeoutMs() {
+    return TIMEOUT_CONFIG.PAYMENT_TIMEOUT_HOURS * 3600 * 1000;
+  }
+
+  _isTicketPurchaseExpired(purchase) {
+    return purchase.expiresAt != null && Date.now() > purchase.expiresAt;
+  }
+
+  async _resolveTicketPurchaseStatus(purchase) {
+    if (purchase.status === 'pending' && this._isTicketPurchaseExpired(purchase)) {
+      purchase.status = 'expired';
+      if (purchase.payAmountSun != null) await this._releasePaySlot(purchase.payAmountSun);
+      await this.db.put(`ticket_purchase:${purchase.id}`, purchase);
+    }
+    return purchase;
+  }
+
+  async _listReservedPayAmountSuns() {
+    const suns = new Set();
+    for await (const [, slot] of this.db.iterator({ gte: 'pay_slot:', lte: 'pay_slot:\xff' })) {
+      if (slot?.sun != null) suns.add(slot.sun);
+    }
+    return suns;
+  }
+
+  async _releasePaySlot(payAmountSun) {
+    try {
+      await this.db.del(`pay_slot:${payAmountSun}`);
+    } catch (_) {}
+  }
+
+  /** 全库唯一支付金额（sun），避免多笔同金额撞单 */
+  async _allocateUniquePayAmount({ approxTrx, minTrx, maxTrx, refType, refId }) {
+    const used = await this._listReservedPayAmountSuns();
+    for (let attempt = 0; attempt < 8000; attempt += 1) {
+      const tail = Math.floor(Math.random() * 9999) / 10000;
+      let trx = Math.round((approxTrx + tail) * 10000) / 10000;
+      if (minTrx != null) trx = Math.max(minTrx, trx);
+      if (maxTrx != null) trx = Math.min(maxTrx, trx);
+      const sun = Math.round(trx * 1e6);
+      if (used.has(sun)) continue;
+      await this.db.put(`pay_slot:${sun}`, { sun, trx, refType, refId, at: Date.now() });
+      return { payAmount: trx, payAmountSun: sun };
+    }
+    throw new Error('无法生成唯一支付金额，请稍后重试');
+  }
+
+  async _claimTxHash(txHash, meta = {}) {
+    if (!txHash || String(txHash).startsWith('listener_auto_')) return;
+    const key = `tx_used:${txHash}`;
+    try {
+      await this.db.get(key);
+      throw new Error('该链上交易已用于其他订单');
+    } catch (e) {
+      if (e.message === '该链上交易已用于其他订单') throw e;
+    }
+    await this.db.put(key, { ...meta, at: Date.now() });
+  }
+
+  /** 创建待支付购票单：self=本机转账认付款方；friend=朋友代付认唯一金额 */
+  async buyTicket(command) {
+    const treasury = PAYMENT_CONFIG.TREASURY_ADDRESS;
+    if (!treasury || treasury.includes('PLACEHOLDER')) {
+      throw new Error('服务端收款地址未配置，请在 deploy/.env 设置 TREASURY_ADDRESS 并重启 node1');
+    }
+    await this.requireUser(command.userAddress);
+    const qty = Math.max(1, Math.floor(command.amount || 1));
+    const payMode = command.payMode === 'friend' ? 'friend' : 'self';
+    const purchaseId = `tp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    const createdAt = Date.now();
+
+    let unitPrice;
+    let payAmount;
+    let payAmountSun;
+
+    if (payMode === 'self') {
+      unitPrice = TICKET_PRICE_CONFIG.BASE_PRICE;
+      payAmount = unitPrice * qty;
+      payAmountSun = Math.round(payAmount * 1e6);
+    } else {
+      unitPrice = this._randomUnitPrice();
+      const approxTrx = Math.round(unitPrice * qty * 100) / 100;
+      ({ payAmount, payAmountSun } = await this._allocateUniquePayAmount({
+        approxTrx,
+        minTrx: TICKET_PRICE_CONFIG.MIN_PRICE * qty,
+        maxTrx: TICKET_PRICE_CONFIG.MAX_PRICE * qty + 0.9999,
+        refType: 'ticket',
+        refId: purchaseId,
+      }));
+    }
+
+    const purchase = {
+      id: purchaseId,
       userAddress: command.userAddress,
-      amount: command.amount,
-      txHash: command.txHash,
-      at: Date.now(),
-    });
-    return user;
+      amount: qty,
+      unitPrice,
+      payAmount,
+      payAmountSun,
+      payMode,
+      matchMode: payMode === 'self' ? 'payer_and_amount' : 'unique_amount',
+      expectedPayer: payMode === 'self' ? command.userAddress : null,
+      treasury: PAYMENT_CONFIG.TREASURY_ADDRESS,
+      status: 'pending',
+      createdAt,
+      expiresAt: createdAt + this._ticketPaymentTimeoutMs(),
+      pollIntervalMs: TIMEOUT_CONFIG.POLL_INTERVAL_MS,
+      paymentTimeoutHours: TIMEOUT_CONFIG.PAYMENT_TIMEOUT_HOURS,
+    };
+    await this.db.put(`ticket_purchase:${purchaseId}`, purchase);
+    return purchase;
+  }
+
+  _formatReservedAt(ts) {
+    const d = new Date(ts);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  _eventContentHash(payload) {
+    return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
   }
 
   async queueOrder(command) {
@@ -117,43 +229,205 @@ class ReservoirStateMachine {
     user.ticketBalance -= command.ticketCost;
     await this.db.put(`user:${command.userAddress}`, user);
 
+    const reservedAt = Date.now();
+    const reservedAtText = this._formatReservedAt(reservedAt);
+    const eventCore = {
+      type: 'order_queued',
+      orderId: command.orderId,
+      userAddress: command.userAddress,
+      ticketCost: command.ticketCost,
+      amount: command.amount,
+      reservedAt,
+      reservedAtText,
+    };
+    const contentHash = this._eventContentHash(eventCore);
+
     const order = {
       id: command.orderId,
       userAddress: command.userAddress,
       amount: command.amount,
-      payAmount: command.payAmount || command.amount,
+      payAmount: null,
+      payeeAddress: null,
       ticketCost: command.ticketCost,
       tierId: command.tierId || null,
       tierName: command.tierName || '',
       expectedExit: command.expectedExit || 0,
-      status: 'waiting_payment',
-      createdAt: Date.now(),
+      status: 'queued',
+      createdAt: reservedAt,
+      queuedAtText: reservedAtText,
+      queuedContentHash: contentHash,
+      poolContributed: command.amount,
     };
     await this.db.put(`order:${command.orderId}`, order);
-    await this.db.put(`event:${Date.now()}:queue`, {
-      type: 'order_queued',
-      orderId: order.id,
-      userAddress: order.userAddress,
-      amount: order.amount,
-      at: Date.now(),
+
+    const reservoir = await this.ensureReservoir();
+    reservoir.currentAmount += command.amount;
+    await this.db.put(this.reservoirKey, reservoir);
+
+    await this.db.put(`event:${reservedAt}:queue`, {
+      ...eventCore,
+      contentHash,
+      poolDelta: command.amount,
+      reservoirAfter: reservoir.currentAmount,
     });
-    return order;
+
+    await this.tryMatchQueuedOrders();
+    return { order, reservoir, contentHash, reservedAtText };
+  }
+
+  /** 资金池满额等条件满足后，才为排队意向单匹配收款方与应付金额 */
+  async tryMatchQueuedOrders() {
+    const reservoir = await this.ensureReservoir();
+    if (reservoir.currentAmount < reservoir.currentTarget) {
+      return { matched: 0, reason: 'reservoir_not_full' };
+    }
+
+    const queued = [];
+    for await (const [, order] of this.db.iterator({ gte: 'order:', lte: 'order:\xff' })) {
+      if (order.status === 'queued') queued.push(order);
+    }
+    queued.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+    if (!queued.length) return { matched: 0 };
+
+    let matched = 0;
+    for (const order of queued) {
+      const payeeAddress = await this._resolvePayeeForOrder(order);
+      const { payAmount, payAmountSun } = await this._allocateUniquePayAmount({
+        approxTrx: order.amount,
+        minTrx: order.amount,
+        maxTrx: order.amount + 0.9999,
+        refType: 'order',
+        refId: order.id,
+      });
+      order.status = 'waiting_payment';
+      order.payAmount = payAmount;
+      order.payAmountSun = payAmountSun;
+      order.payeeAddress = payeeAddress;
+      order.matchedAt = Date.now();
+      await this.db.put(`order:${order.id}`, order);
+      await this.db.put(`event:${Date.now()}:match`, {
+        type: 'order_matched',
+        orderId: order.id,
+        payeeAddress,
+        payAmount: order.payAmount,
+        at: Date.now(),
+      });
+      matched += 1;
+    }
+    return { matched };
+  }
+
+  async _resolvePayeeForOrder(order) {
+    for await (const [, o] of this.db.iterator({ gte: 'order:', lte: 'order:\xff' })) {
+      if (o.status === 'exiting' && o.userAddress !== order.userAddress) {
+        return o.userAddress;
+      }
+    }
+    return PAYMENT_CONFIG.TREASURY_ADDRESS;
   }
 
   async confirmTicketPayment(command) {
+    const key = `ticket_purchase:${command.purchaseId}`;
+    let purchase;
+    try {
+      purchase = await this.db.get(key);
+    } catch {
+      throw new Error('购票单不存在');
+    }
+    if (purchase.status === 'confirmed') {
+      const user = await this.getUser(command.userAddress);
+      return { user, purchase };
+    }
+    if (purchase.status === 'expired' || this._isTicketPurchaseExpired(purchase)) {
+      throw new Error('购票单已超时');
+    }
+    if (purchase.status !== 'pending') {
+      throw new Error('购票单状态无效');
+    }
+    if (purchase.userAddress !== command.userAddress) {
+      throw new Error('购票单用户不匹配');
+    }
+    if (command.txHash) {
+      await this._claimTxHash(command.txHash, {
+        type: 'ticket',
+        purchaseId: purchase.id,
+        userAddress: command.userAddress,
+      });
+    }
+
     const user = await this.requireUser(command.userAddress);
-    user.ticketBalance += command.amount;
+    const qty = purchase.amount;
+    user.ticketBalance += qty;
+    user.totalPurchased = (user.totalPurchased || 0) + qty;
     await this.db.put(`user:${command.userAddress}`, user);
-    const purchase = {
-      id: command.purchaseId || `tp_${Date.now()}`,
+
+    purchase.status = 'confirmed';
+    purchase.txHash = command.txHash;
+    purchase.payerFrom = command.payerFrom || null;
+    purchase.confirmedAt = Date.now();
+    if (purchase.payAmountSun != null) await this._releasePaySlot(purchase.payAmountSun);
+    await this.db.put(key, purchase);
+
+    await this.db.put(`event:${Date.now()}:buy`, {
+      type: 'ticket_purchased',
       userAddress: command.userAddress,
-      amount: command.amount,
-      payAmount: command.payAmount,
+      amount: qty,
+      payAmount: purchase.payAmount,
+      purchaseId: purchase.id,
       txHash: command.txHash,
       at: Date.now(),
-    };
-    await this.db.put(`ticket_purchase:${purchase.id}`, purchase);
+    });
     return { user, purchase };
+  }
+
+  async getTicketPurchase(purchaseId) {
+    try {
+      const purchase = await this.db.get(`ticket_purchase:${purchaseId}`);
+      return this._resolveTicketPurchaseStatus(purchase);
+    } catch {
+      return null;
+    }
+  }
+
+  async reportTicketSelfTx(purchaseId, userAddress, txHash) {
+    const purchase = await this.getTicketPurchase(purchaseId);
+    if (!purchase) throw new Error('购票单不存在');
+    if (purchase.userAddress !== userAddress) throw new Error('购票单用户不匹配');
+    if (purchase.payMode !== 'self') throw new Error('仅本机购票可提交转账哈希');
+    if (purchase.status === 'confirmed') return { user: await this.getUser(userAddress), purchase };
+    if (purchase.status !== 'pending') throw new Error('购票单状态无效');
+
+    const { fetchTronTransferById, verifySelfTicketTransfer } = require('@mmm/shared');
+    let payerFrom = purchase.expectedPayer;
+
+    if (!String(txHash).startsWith('demo_')) {
+      const tx = await fetchTronTransferById(txHash);
+      const check = verifySelfTicketTransfer(purchase, tx);
+      if (!check.ok) throw new Error(check.error);
+      payerFrom = purchase.expectedPayer;
+    } else if (process.env.NODE_ENV === 'production' && process.env.ALLOW_DEMO_TX !== '1') {
+      throw new Error('演示交易哈希不可用于生产环境');
+    }
+
+    return this.confirmTicketPayment({
+      type: 'CONFIRM_TICKET_PAYMENT',
+      userAddress,
+      purchaseId,
+      amount: purchase.amount,
+      payAmount: purchase.payAmount,
+      txHash,
+      payerFrom,
+    });
+  }
+
+  async getLatestPendingTicketPurchase(userAddress) {
+    let latest = null;
+    for await (const [, purchase] of this.db.iterator({ gte: 'ticket_purchase:', lte: 'ticket_purchase:\xff' })) {
+      if (purchase.userAddress === userAddress && purchase.status === 'pending') {
+        if (!latest || (purchase.createdAt || 0) > (latest.createdAt || 0)) latest = purchase;
+      }
+    }
+    return latest;
   }
 
   async dailyCheckin(command) {
@@ -177,25 +451,40 @@ class ReservoirStateMachine {
     const order = await this.getOrder(command.orderId);
     if (!order) throw new Error('订单不存在');
     if (order.status !== 'waiting_payment') throw new Error('订单状态不可确认');
+    if (command.txHash) {
+      await this._claimTxHash(command.txHash, {
+        type: 'order',
+        orderId: order.id,
+        userAddress: order.userAddress,
+      });
+    }
 
     order.status = 'confirmed';
     order.txHash = command.txHash;
+    order.payerFrom = command.payerFrom || null;
     order.confirmedAt = Date.now();
+    if (order.payAmountSun != null) await this._releasePaySlot(order.payAmountSun);
     order.exitEligibleAt = order.confirmedAt + this._fillDelayMs();
     await this.db.put(`order:${command.orderId}`, order);
 
     const reservoir = await this.ensureReservoir();
-    reservoir.currentAmount += order.amount;
-    await this.db.put(this.reservoirKey, reservoir);
 
     await this.grantBurnBonus(order);
-    await this.db.put(`event:${Date.now()}:pay`, {
+    const confirmedAt = Date.now();
+    const confirmedAtText = this._formatReservedAt(confirmedAt);
+    const payEventCore = {
       type: 'payment_confirmed',
       orderId: order.id,
       userAddress: order.userAddress,
-      amount: order.payAmount || order.amount,
+      payAmount: order.payAmount || order.amount,
+      tierAmount: order.amount,
       txHash: command.txHash,
-      at: Date.now(),
+      confirmedAt,
+      confirmedAtText,
+    };
+    await this.db.put(`event:${confirmedAt}:pay`, {
+      ...payEventCore,
+      contentHash: this._eventContentHash(payEventCore),
     });
 
     return { order, reservoir };
@@ -320,6 +609,19 @@ class ReservoirStateMachine {
     return `${addr.substring(0, 6)}…${addr.substring(addr.length - 4)}`;
   }
 
+  async _countDirectWithMinOrderAmount(parentAddress, minAmount) {
+    const children = await this.getDirectChildren(parentAddress);
+    const active = new Set(['queued', 'waiting_payment', 'confirmed', 'exiting', 'exited']);
+    let count = 0;
+    for (const child of children) {
+      const orders = await this.getOrdersByUser(child);
+      if (orders.some((o) => active.has(o.status) && (o.amount || 0) >= minAmount)) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
   async getPerformance(userAddress) {
     const user = await this.getUser(userAddress);
     const orders = await this.getOrdersByUser(userAddress);
@@ -330,9 +632,13 @@ class ReservoirStateMachine {
       if (o.status === 'exited') totalExited += o.expectedExit || o.amount;
     }
     const burns = await this.getBurnRewards(userAddress);
+    const middleTierCount = await this._countDirectWithMinOrderAmount(userAddress, 10000);
+    const largeTierCount = await this._countDirectWithMinOrderAmount(userAddress, 100000);
     return {
       teamCount: user?.teamCount || 0,
       directCount: user?.directCount || 0,
+      middleTierCount,
+      largeTierCount,
       ticketBalance: user?.ticketBalance || 0,
       rewardBalance: user?.rewardBalance || 0,
       totalPurchased: user?.totalPurchased || 0,
@@ -373,11 +679,34 @@ class ReservoirStateMachine {
     for await (const [, order] of this.db.iterator({ gte: 'order:', lte: 'order:\xff' })) {
       if (order.status === 'waiting_payment') {
         payments.push({
+          type: 'order',
           orderId: order.id,
           userAddress: order.userAddress,
           payAmount: order.payAmount || order.amount,
-          treasury: PAYMENT_CONFIG.TREASURY_ADDRESS,
+          payAmountSun: order.payAmountSun,
+          payeeAddress: order.payeeAddress || PAYMENT_CONFIG.TREASURY_ADDRESS,
+          treasury: order.payeeAddress || PAYMENT_CONFIG.TREASURY_ADDRESS,
           createdAt: order.createdAt,
+          matchedAt: order.matchedAt,
+        });
+      }
+    }
+    for await (const [, raw] of this.db.iterator({ gte: 'ticket_purchase:', lte: 'ticket_purchase:\xff' })) {
+      const purchase = await this._resolveTicketPurchaseStatus(raw);
+      if (purchase.status === 'pending') {
+        payments.push({
+          type: 'ticket',
+          purchaseId: purchase.id,
+          userAddress: purchase.userAddress,
+          amount: purchase.amount,
+          payAmount: purchase.payAmount,
+          payAmountSun: purchase.payAmountSun,
+          payMode: purchase.payMode || 'friend',
+          matchMode: purchase.matchMode,
+          expectedPayer: purchase.expectedPayer,
+          treasury: purchase.treasury || PAYMENT_CONFIG.TREASURY_ADDRESS,
+          createdAt: purchase.createdAt,
+          expiresAt: purchase.expiresAt,
         });
       }
     }
@@ -465,7 +794,7 @@ class ReservoirStateMachine {
     const counts = { queued: 0, paying: 0, earning: 0, done: 0 };
     for (const o of orders) {
       if (o.status === 'waiting_payment') counts.paying += 1;
-      else if (o.status === 'confirmed') counts.queued += 1;
+      else if (o.status === 'queued' || o.status === 'confirmed') counts.queued += 1;
       else if (o.status === 'exiting') counts.earning += 1;
       else if (o.status === 'exited') counts.done += 1;
     }
@@ -499,14 +828,16 @@ class ReservoirStateMachine {
   }
 
   ticketQuote() {
-    const min = TICKET_PRICE_CONFIG.MIN_PRICE;
-    const max = TICKET_PRICE_CONFIG.MAX_PRICE;
-    const payAmount = Math.round((min + Math.random() * (max - min)) * 100) / 100;
+    const unitPrice = this._randomUnitPrice();
     return {
       basePrice: TICKET_PRICE_CONFIG.BASE_PRICE,
-      payAmount,
+      unitPrice,
+      payAmount: unitPrice,
       quantity: 1,
-      treasury: 'TREASURY_MULTISIG_PLACEHOLDER',
+      treasury: PAYMENT_CONFIG.TREASURY_ADDRESS,
+      pollIntervalMs: TIMEOUT_CONFIG.POLL_INTERVAL_MS,
+      paymentTimeoutHours: TIMEOUT_CONFIG.PAYMENT_TIMEOUT_HOURS,
+      paymentTimeoutMs: this._ticketPaymentTimeoutMs(),
     };
   }
 

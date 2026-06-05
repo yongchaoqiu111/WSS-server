@@ -9,6 +9,10 @@ const WebSocket = require('ws');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const GATEWAY_PORT = Number(process.env.GATEWAY_PORT || 8443);
+const GATEWAY_DOMAINS = (process.env.GATEWAY_DOMAINS || 'book26.top,news16.top')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 const UPSTREAM_NODES = (process.env.UPSTREAM_NODES || 'http://127.0.0.1:3001,http://127.0.0.1:3002,http://127.0.0.1:3003')
   .split(',')
   .map((s) => s.trim())
@@ -48,8 +52,27 @@ app.get('/health', async (_req, res) => {
   res.json({ ok: true, upstream, nodes: UPSTREAM_NODES });
 });
 
-app.get('/', async (_req, res) => {
+app.get('/api/domains', (_req, res) => {
+  const domains = GATEWAY_DOMAINS.map((host, i) => ({
+    id: host.replace(/\./g, '_'),
+    name: `网关 ${String.fromCharCode(65 + i)} · ${host}`,
+    apiUrl: `https://${host}`,
+    wsUrl: `wss://${host}/ws`,
+    status: 'online',
+  }));
+  res.json({ domains });
+});
+
+app.get('/', async (req, res) => {
   const upstream = await rotateHealthyNode();
+  const host = req.get('host') || GATEWAY_DOMAINS[0] || 'localhost';
+  const publicApi = host.includes('localhost') || host.includes('127.0.0.1')
+    ? `http://127.0.0.1:${GATEWAY_PORT}`
+    : `https://${host}`;
+  const publicWs = publicApi.startsWith('https')
+    ? `wss://${host.split(':')[0]}/ws`
+    : `ws://127.0.0.1:${GATEWAY_PORT}/ws`;
+  const domainList = GATEWAY_DOMAINS.map((d) => `<li><code>https://${d}</code> / <code>wss://${d}/ws</code></li>`).join('');
   res.type('html').send(`<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>MMM Gateway</title>
 <style>body{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;color:#222}
@@ -60,12 +83,12 @@ code{background:#f4f4f4;padding:2px 6px;border-radius:4px}</style></head>
 <ul>
 <li>健康检查：<code><a href="/health">/health</a></code></li>
 <li>共识 API：<code>/api/*</code>（例：<a href="/api/status">/api/status</a>）</li>
-<li>WebSocket：<code>ws://127.0.0.1:${GATEWAY_PORT}/ws</code></li>
+<li>域名列表：<code><a href="/api/domains">/api/domains</a></code></li>
+<li>WebSocket：<code>${publicWs}</code></li>
 <li>当前上游节点：<code>${upstream}</code></li>
 </ul>
-<p>请启动 Flutter 客户端测试：</p>
-<pre>cd F:\\3MMM\\MMM\\client\nflutter run -d chrome</pre>
-<p>App 内节点地址填 <code>http://127.0.0.1:${GATEWAY_PORT}</code></p>
+<p>默认双域名：</p><ul>${domainList}</ul>
+<p>Flutter App 节点地址填 <code>${publicApi}</code>，WSS 填 <code>${publicWs}</code></p>
 </body></html>`);
 });
 
@@ -80,10 +103,25 @@ app.use(
   })
 );
 
+function isAllowedWsHost(hostHeader) {
+  if (!hostHeader) return false;
+  const h = String(hostHeader).split(':')[0].toLowerCase();
+  if (GATEWAY_DOMAINS.includes(h)) return true;
+  if (h === 'localhost' || h === '127.0.0.1') return true;
+  return false;
+}
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
-wss.on('connection', async (clientWs) => {
+wss.on('connection', async (clientWs, req) => {
+  const host = req.headers.host || '';
+  if (!isAllowedWsHost(host)) {
+    console.warn('[gateway] ws rejected, invalid Host:', host);
+    clientWs.close(1008, 'invalid host');
+    return;
+  }
+
   const upstreamBase = await rotateHealthyNode();
   const upstreamUrl = upstreamBase.replace(/^http/, 'ws');
   const nodeWs = new WebSocket(upstreamUrl);
