@@ -10,8 +10,7 @@ Flutter 客户端、设计文档在**其他仓库**，不在此库。
 |------|------|
 | `gateway/` | 无状态 WSS/HTTP 网关 |
 | `private-chain/` | Raft 节点 + 状态机 |
-| `shared/` | 排单/蓄水池规则 |
-| `docs/` | 算法说明（中英文） |
+| `shared/` | 历史规则脚本（排单逻辑以 [Client-flutter](https://github.com/yongchaoqiu111/Client-flutter) 为准） |
 | `listener/` | TRX 链监听（无私钥） |
 | `anchor/` | Merkle 存证载荷（无私钥） |
 | `deploy/` | Docker + Nginx + `install.sh` |
@@ -42,17 +41,6 @@ npm run node2
 npm run node3
 npm run gateway
 ```
-
-## 排单算法（pool-v4-dual-pool）
-
-无服务器双池排单规则，公开可回放、主网验款：
-
-| 文档 | 说明 |
-|------|------|
-| [docs/pool-v4-algorithm-zh.md](docs/pool-v4-algorithm-zh.md) | 中文版 |
-| [docs/pool-v4-algorithm-en.md](docs/pool-v4-algorithm-en.md) | English |
-
-参考实现：`shared/pool-rules.js`、`shared/pool-config.js`、`shared/exit-pay-verify.js`
 
 ## 客户端配置
 
