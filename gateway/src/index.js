@@ -92,6 +92,22 @@ code{background:#f4f4f4;padding:2px 6px;border-radius:4px}</style></head>
 </body></html>`);
 });
 
+/** 池子 checkpoint / 配置：固定走 node1，避免多节点轮询导致高度不一致 */
+const POOL_UPSTREAM =
+  process.env.WS_UPSTREAM_NODE ||
+  UPSTREAM_NODES[0] ||
+  'http://127.0.0.1:3001';
+
+app.use(
+  '/api/pool',
+  createProxyMiddleware({
+    target: POOL_UPSTREAM,
+    changeOrigin: true,
+    ws: false,
+    pathRewrite: (path) => `/api/pool${path}`,
+  }),
+);
+
 app.use(
   '/api',
   createProxyMiddleware({
@@ -114,6 +130,11 @@ function isAllowedWsHost(hostHeader) {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
+const WS_UPSTREAM =
+  process.env.WS_UPSTREAM_NODE ||
+  UPSTREAM_NODES[0] ||
+  'http://127.0.0.1:3001';
+
 wss.on('connection', async (clientWs, req) => {
   const host = req.headers.host || '';
   if (!isAllowedWsHost(host)) {
@@ -122,11 +143,19 @@ wss.on('connection', async (clientWs, req) => {
     return;
   }
 
-  const upstreamBase = await rotateHealthyNode();
+  const upstreamBase = WS_UPSTREAM;
   const upstreamUrl = upstreamBase.replace(/^http/, 'ws');
   const nodeWs = new WebSocket(upstreamUrl);
+  const pending = [];
+
+  const flushPending = () => {
+    while (pending.length && nodeWs.readyState === WebSocket.OPEN) {
+      nodeWs.send(pending.shift());
+    }
+  };
 
   nodeWs.on('open', () => {
+    flushPending();
     clientWs.send(JSON.stringify({ type: 'gateway_connected', upstream: upstreamBase }));
   });
 
@@ -136,6 +165,7 @@ wss.on('connection', async (clientWs, req) => {
 
   clientWs.on('message', (data) => {
     if (nodeWs.readyState === WebSocket.OPEN) nodeWs.send(data);
+    else pending.push(data);
   });
 
   const closeBoth = () => {

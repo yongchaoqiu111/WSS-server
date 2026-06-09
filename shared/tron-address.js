@@ -16,10 +16,11 @@ function tronBase58ToHex(address) {
 }
 
 function tronAddressesEqual(a, b) {
+  if (a == null || b == null) return false;
   const ha = tronBase58ToHex(a);
   const hb = tronBase58ToHex(b);
-  if (!ha || !hb) return false;
-  return ha === hb;
+  if (ha && hb) return ha === hb;
+  return String(a).trim() === String(b).trim();
 }
 
 module.exports = {

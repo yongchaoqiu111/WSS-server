@@ -10,6 +10,12 @@ services:
       DEMO_FAST_EXIT: ${DEMO_FAST_EXIT:-0}
       REQUIRE_SIGNATURE: ${REQUIRE_SIGNATURE:-0}
       TREASURY_ADDRESS: ${TREASURY_ADDRESS:-}
+      CHECKPOINT_PUBLISHER: ${CHECKPOINT_PUBLISHER:-1}
+      TRONGRID_API_KEY: ${TRONGRID_API_KEY:-}
+      POOL_EXIT_ADDRESS: ${POOL_EXIT_ADDRESS:-TRjvctzrc5WcEeu2UrT8mV5H6zW8dCgimR}
+      POOL_ADDRESS_3000: ${POOL_ADDRESS_3000:-}
+      POOL_ADDRESS_30000: ${POOL_ADDRESS_30000:-}
+      POOL_ADDRESS_300000: ${POOL_ADDRESS_300000:-}
       RAFT_PEERS: '[{"id":"node1","host":"node1","port":3001},{"id":"node2","host":"node2","port":3002},{"id":"node3","host":"node3","port":3003}]'
     volumes:
       - node1-data:/app/private-chain/data
@@ -51,6 +57,7 @@ services:
       GATEWAY_PORT: 8443
       GATEWAY_DOMAINS: ${GATEWAY_DOMAINS:-book26.top,news16.top}
       UPSTREAM_NODES: http://node1:3001,http://node2:3002,http://node3:3003
+      WS_UPSTREAM_NODE: http://node1:3001
     ports:
       - "127.0.0.1:8443:8443"
     depends_on: [node1, node2, node3]

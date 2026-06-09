@@ -11,6 +11,13 @@ const {
   DEFAULT_ANNOUNCEMENTS,
   PAYMENT_CONFIG,
   TIMEOUT_CONFIG,
+  COMMAND_TYPES,
+  POOL_PURCHASE_CONFIG,
+  POOL_RULES_VERSION,
+  CHECKPOINT_INTERVAL_MS,
+  checkpointDayId,
+  checkpointCutoffMs,
+  fetchLatestTronBlock,
 } = require('@mmm/shared');
 const { checkSend } = require('../../shared/chat-moderation');
 const { RaftNode, State } = require('./raft');
@@ -50,6 +57,8 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 const clients = new Map();
+const CHAT_HISTORY_MAX = 100;
+const chatHistoryByRoom = new Map();
 
 app.get('/health', (_req, res) => res.json({ ok: true, nodeId: NODE_ID }));
 
@@ -93,6 +102,54 @@ app.get('/api/announcements', (_req, res) => {
 
 app.get('/api/ticket/quote', (_req, res) => {
   res.json(stateMachine.ticketQuote());
+});
+
+/** 统一计算截取高度（所有 WSS 网关应固定转发到 node1 读本接口） */
+app.get('/api/pool/checkpoint', async (_req, res) => {
+  const checkpoint = await stateMachine.getPoolCheckpoint();
+  if (!checkpoint) {
+    return res.status(503).json({
+      error: 'checkpoint 尚未发布',
+      hint: '仅 node1 leader 每小时发布；请确认 CHECKPOINT_PUBLISHER=1',
+      nodeId: NODE_ID,
+      isLeader: raft.state === State.LEADER,
+    });
+  }
+  res.json({ ok: true, nodeId: NODE_ID, checkpoint });
+});
+
+/** 三档公开购券地址（与客户端硬编码一致，可 HTTP 拉取） */
+app.get('/api/pool/config', (_req, res) => {
+  const {
+    ENTRY_PERIOD_DAYS,
+    EXIT_PERIOD_DAYS,
+    MATCH_PAYMENT_TIMEOUT_HOURS,
+    MAX_OPEN_ENTRIES_PER_PAYER,
+    MAX_SPLITS_PER_PAYER,
+    DAILY_MATCH_UTC_HOUR,
+    MATCHES_PER_DAY,
+    checkpointCutoffMs,
+    checkpointDayId,
+    dailyMatchContext,
+  } = require('@mmm/shared');
+  const matchCtx = dailyMatchContext();
+  res.json({
+    rulesVersion: POOL_RULES_VERSION,
+    scheme: 'A',
+    checkpointIntervalMs: CHECKPOINT_INTERVAL_MS,
+    checkpointDayId: checkpointDayId(),
+    checkpointCutoffMs: checkpointCutoffMs(),
+    dailyMatch: matchCtx,
+    matchesPerDay: MATCHES_PER_DAY,
+    matchUtcHour: DAILY_MATCH_UTC_HOUR,
+    beijingMatchHour: DAILY_MATCH_UTC_HOUR + 8,
+    entryPeriodDays: ENTRY_PERIOD_DAYS,
+    exitPeriodDays: EXIT_PERIOD_DAYS,
+    matchPaymentTimeoutHours: MATCH_PAYMENT_TIMEOUT_HOURS,
+    maxOpenEntriesPerPayer: MAX_OPEN_ENTRIES_PER_PAYER,
+    maxSplitsPerPayer: MAX_SPLITS_PER_PAYER,
+    pools: POOL_PURCHASE_CONFIG,
+  });
 });
 
 /** 诊断：收款地址是否从环境变量生效（部署后可用 curl 自测） */
@@ -196,7 +253,12 @@ app.post('/api/command', async (req, res) => {
   if (!result.success) return res.status(400).json(result);
 
   raft.commitIndex = raft.log.length - 1;
-  await raft.applyLogs();
+  try {
+    await raft.applyLogs();
+  } catch (err) {
+    console.error('[api/command] apply failed:', err.message);
+    return res.status(400).json({ success: false, error: err.message || '命令执行失败' });
+  }
 
   const payload = { success: true, index: result.index };
   if (command.type === 'BUY_TICKET' && userAddress) {
@@ -259,9 +321,22 @@ wss.on('connection', (ws, req) => {
         ws.send(JSON.stringify({ type: 'notification', topic: 'reservoir_updates', data: reservoir }));
       }
 
+      if (message.type === 'subscribe' && message.topic === 'pool_checkpoint') {
+        ws.poolCheckpoint = true;
+        const checkpoint = await stateMachine.getPoolCheckpoint();
+        if (checkpoint) {
+          ws.send(JSON.stringify({ type: 'notification', topic: 'pool_checkpoint', data: checkpoint }));
+        }
+      }
+
       if (message.type === 'subscribe' && String(message.topic || '').startsWith('chat_')) {
         ws.chatRooms = ws.chatRooms || new Set();
-        ws.chatRooms.add(String(message.topic).replace(/^chat_/, '') || 'hall');
+        const room = String(message.topic).replace(/^chat_/, '') || 'hall';
+        ws.chatRooms.add(room);
+        const history = chatHistoryByRoom.get(room) || [];
+        if (history.length) {
+          ws.send(JSON.stringify({ type: 'notification', topic: `chat_${room}`, data: history }));
+        }
       }
 
       if (message.type === 'chat_send') {
@@ -270,20 +345,21 @@ wss.on('connection', (ws, req) => {
         const content = String(message.content || '').trim();
         const check = checkSend({ sender, content });
         if (!check.ok) {
-          ws.send(JSON.stringify({ type: 'chat_rejected', reason: check.reason }));
+          ws.send(JSON.stringify({ type: 'chat_rejected', room, reason: check.reason }));
           return;
         }
-        const payload = {
-          type: 'notification',
-          topic: 'chat_hall',
-          data: {
-            id: `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-            room,
-            sender,
-            content,
-            at: Date.now(),
-          },
+        const msg = {
+          id: `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          room,
+          sender,
+          content,
+          at: Date.now(),
         };
+        const history = chatHistoryByRoom.get(room) || [];
+        history.push(msg);
+        if (history.length > CHAT_HISTORY_MAX) history.splice(0, history.length - CHAT_HISTORY_MAX);
+        chatHistoryByRoom.set(room, history);
+        const payload = { type: 'notification', topic: `chat_${room}`, data: msg };
         broadcastChat(room, payload);
       }
     } catch (err) {
@@ -310,6 +386,61 @@ function broadcastChat(room, payload) {
   });
 }
 
+function broadcastPoolCheckpoint(checkpoint) {
+  const payload = { type: 'notification', topic: 'pool_checkpoint', data: checkpoint };
+  const text = JSON.stringify(payload);
+  clients.forEach((ws) => {
+    if (ws.readyState === WebSocket.OPEN && ws.poolCheckpoint) {
+      ws.send(text);
+    }
+  });
+}
+
+async function publishPoolCheckpoint() {
+  if (NODE_ID !== 'node1' || raft.state !== State.LEADER) return null;
+  if (process.env.CHECKPOINT_PUBLISHER === '0') return null;
+
+  const block = await fetchLatestTronBlock();
+  const command = {
+    type: COMMAND_TYPES.SET_POOL_CHECKPOINT,
+    checkpointId: checkpointDayId(),
+    blockNumber: block.blockNumber,
+    blockHash: block.blockHash,
+    blockTimestamp: block.blockTimestamp,
+    rulesVersion: POOL_RULES_VERSION,
+    publishedAt: Date.now(),
+    publisherNode: NODE_ID,
+  };
+
+  const result = raft.submitCommand(command);
+  if (!result.success) {
+    console.warn('[checkpoint] submit failed:', result.error);
+    return null;
+  }
+  raft.commitIndex = raft.log.length - 1;
+  await raft.applyLogs();
+  const saved = await stateMachine.getPoolCheckpoint();
+  if (saved) {
+    console.log(
+      `[checkpoint] 已发布 hour=${saved.checkpointId} block=${saved.blockNumber} ts=${saved.blockTimestamp}`,
+    );
+    broadcastPoolCheckpoint(saved);
+  }
+  return saved;
+}
+
+function startCheckpointPublisher() {
+  if (NODE_ID !== 'node1' || process.env.CHECKPOINT_PUBLISHER === '0') return;
+
+  const tick = () => {
+    publishPoolCheckpoint().catch((e) => console.warn('[checkpoint]', e.message));
+  };
+
+  tick();
+  setInterval(tick, CHECKPOINT_INTERVAL_MS);
+  console.log(`[checkpoint] node1 发布器已启动，间隔 ${CHECKPOINT_INTERVAL_MS / 1000}s`);
+}
+
 function startConsensusDemo() {
   if (NODE_ID === 'node1') {
     raft.state = State.LEADER;
@@ -321,6 +452,7 @@ function startConsensusDemo() {
     setInterval(() => {
       stateMachine.processExitQueue().catch((e) => console.warn('[exit-queue]', e.message));
     }, process.env.DEMO_FAST_EXIT === '1' ? 15000 : 3600000);
+    startCheckpointPublisher();
   }
 }
 

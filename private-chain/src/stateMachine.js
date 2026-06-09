@@ -54,6 +54,10 @@ class ReservoirStateMachine {
         return this.submitThankLetter(command);
       case COMMAND_TYPES.UPDATE_RESERVOIR:
         return this.updateReservoir(command);
+      case COMMAND_TYPES.SET_PAYMENT_ADDRESS:
+        return this.setPaymentAddress(command);
+      case COMMAND_TYPES.SET_POOL_CHECKPOINT:
+        return this.setPoolCheckpoint(command);
       default:
         console.warn('[StateMachine] Unknown command:', command.type);
         return null;
@@ -74,6 +78,8 @@ class ReservoirStateMachine {
       teamCount: 0,
       lastCheckinAt: 0,
       thankLetterRate: 0,
+      paymentAddress: null,
+      paymentAddressChangesLeft: 1,
       createdAt: Date.now(),
     };
     await this.db.put(key, user);
@@ -320,10 +326,25 @@ class ReservoirStateMachine {
   async _resolvePayeeForOrder(order) {
     for await (const [, o] of this.db.iterator({ gte: 'order:', lte: 'order:\xff' })) {
       if (o.status === 'exiting' && o.userAddress !== order.userAddress) {
-        return o.userAddress;
+        const payee = await this.getUser(o.userAddress);
+        return payee?.paymentAddress || o.userAddress;
       }
     }
     return PAYMENT_CONFIG.TREASURY_ADDRESS;
+  }
+
+  async setPaymentAddress(command) {
+    const user = await this.requireUser(command.userAddress);
+    const left = user.paymentAddressChangesLeft ?? 1;
+    if (left <= 0) throw new Error('收款地址更换次数已用完');
+    const addr = String(command.paymentAddress || '').trim();
+    if (!addr.startsWith('T') || addr.length < 30 || addr.includes('PLACEHOLDER')) {
+      throw new Error('请输入有效的 TRON 收款地址（T 开头）');
+    }
+    user.paymentAddress = addr;
+    user.paymentAddressChangesLeft = left - 1;
+    await this.db.put(`user:${command.userAddress}`, user);
+    return { user };
   }
 
   async confirmTicketPayment(command) {
@@ -751,6 +772,41 @@ class ReservoirStateMachine {
     Object.assign(reservoir, command.patch || {});
     await this.db.put(this.reservoirKey, reservoir);
     return reservoir;
+  }
+
+  async setPoolCheckpoint(command) {
+    const key = 'pool:checkpoint:current';
+    let prev = null;
+    try {
+      prev = await this.db.get(key);
+    } catch (_) {}
+
+    const next = {
+      checkpointId: command.checkpointId,
+      blockNumber: command.blockNumber,
+      blockHash: command.blockHash || '',
+      blockTimestamp: command.blockTimestamp,
+      rulesVersion: command.rulesVersion || 'pool-v1',
+      publishedAt: command.publishedAt || Date.now(),
+      publisherNode: command.publisherNode || 'node1',
+    };
+
+    if (prev?.checkpointId === next.checkpointId) return prev;
+    if (prev?.blockNumber != null && next.blockNumber < prev.blockNumber) {
+      throw new Error('checkpoint block 不能回退');
+    }
+
+    await this.db.put(key, next);
+    await this.db.put(`pool:checkpoint:log:${next.checkpointId}`, next);
+    return next;
+  }
+
+  async getPoolCheckpoint() {
+    try {
+      return await this.db.get('pool:checkpoint:current');
+    } catch {
+      return null;
+    }
   }
 
   async requireUser(address) {
